@@ -1,77 +1,128 @@
 import WebSocket from 'ws';
-import { config } from '../config';
+import { config } from '../config.js';
 
-/**
- * RCONを通じてサーバーと通信を行うクラス
- */
+type LogCallback = (message: string) => void;
+
+interface RconResponse {
+    Identifier: number;
+    Message: string;
+    Type: string;
+}
+
 export class RconService {
     private ws: WebSocket | null = null;
-    private isConnected = false;
+    private _isConnected = false;
+    private messageIdCounter = 1000;
 
-    constructor() {
+    private readonly logListeners: LogCallback[] = [];
+    private readonly pendingRequests = new Map<number, (response: string) => void>();
+
+    public constructor() {
         this.connect();
     }
-    /**
-     * RCONサーバーへ接続を確立する
-     */
-    private connect() {
+
+    public get isConnected(): boolean {
+        return this._isConnected;
+    }
+
+    public onLogMessage(callback: LogCallback): void {
+        this.logListeners.push(callback);
+    }
+
+    private connect(): void {
         const url = `ws://${config.rcon.ip}:${config.rcon.port}/${config.rcon.password}`;
-        console.log(`[RCON] Connecting to ${url.replace(config.rcon.password, '****')}...`);
 
         this.ws = new WebSocket(url);
 
         this.ws.on('open', () => {
-            console.log('[RCON] Connected.');
-            this.isConnected = true;
+            console.log('[RCON] Connected to Server.');
+            this._isConnected = true;
         });
 
         this.ws.on('message', (data) => {
             try {
-                const json = JSON.parse(data.toString());
-                if (json.Type === 'Chat') {
-                    this.chat(json.Message);
+                const json = JSON.parse(data.toString()) as RconResponse;
+                
+                if (this.pendingRequests.has(json.Identifier)) {
+                    const resolve = this.pendingRequests.get(json.Identifier);
+                    if (resolve) {
+                        resolve(json.Message);
+                        this.pendingRequests.delete(json.Identifier);
+                    }
+                    return;
                 }
-            } catch (e) {
+
+                if (json.Message) {
+                    this.logListeners.forEach((listener) => listener(json.Message));
+                }
+            } catch (error) {
             }
         });
 
         this.ws.on('close', () => {
-            console.log('[RCON] Disconnected. Reconnecting...');
-            this.isConnected = false;
+            if (this._isConnected) {
+                console.log('[RCON] Connection lost. Waiting for server...');
+            }
+            this._isConnected = false;
+            this.pendingRequests.clear();
+            
             setTimeout(() => this.connect(), config.rcon.reconnectInterval);
         });
 
-        this.ws.on('error', (err) => {
-            console.error('[RCON] Error:', err.message);
+        this.ws.on('error', (err: Error & { code?: string }) => {
+            if (err.code === 'ECONNREFUSED') return;
+            console.error(`[RCON] Error: ${err.message}`);
         });
     }
-    /**
-     * チャットメッセージを処理する
-     * @param message チャットメッセージの内容
-     */
-    private chat(message: string) {
-        if (message.includes('!pop')) {
-            this.send('status', 1001);
+
+    public send(command: string): void {
+        if (!this.ws || !this._isConnected) return;
+        try {
+            this.ws.send(JSON.stringify({
+                Identifier: -1,
+                Message: command,
+                Name: 'RustBot'
+            }));
+        } catch (e) {
         }
     }
-    /**
-     * コマンドをRCONサーバーに送信する
-     * @param command 送信するコマンド
-     * @param identifier コマンドの識別子（デフォルトは-1）
-     */
-    public send(command: string, identifier = -1) {
-        if (!this.ws || !this.isConnected) return;
-        this.ws.send(JSON.stringify({
-            Identifier: identifier,
-            Message: command,
-            Name: 'RustBot'
-        }));
+
+    public async sendCommand(command: string): Promise<string> {
+        if (!this.ws || !this._isConnected) throw new Error('RCON not connected');
+
+        const id = this.messageIdCounter++;
+        return new Promise<string>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                if (this.pendingRequests.has(id)) {
+                    this.pendingRequests.delete(id);
+                    reject(new Error('Timeout'));
+                }
+            }, 5000);
+
+            this.pendingRequests.set(id, (response) => {
+                clearTimeout(timeout);
+                resolve(response);
+            });
+
+            this.ws?.send(JSON.stringify({
+                Identifier: id,
+                Message: command,
+                Name: 'RustBot'
+            }));
+        });
     }
-    /**
-     * メッセージをサーバー全体にブロードキャストする
-     * @param message ブロードキャストするメッセージ
-     */
-    public broadcast(message: string) {
+
+    public whisper(steamId: string, message: string): void {
+        if (!this._isConnected) return;
+        console.log(`[Whisper -> ${steamId}] ${message}`);
+        this.send(`bot.pm ${steamId} ${message}`);
+    }
+
+    public broadcast(message: string): void {
+        if (!this._isConnected) {
+            console.log(`[Broadcast (Server Offline)] ${message}`);
+            return;
+        }
         console.log(`[Broadcast] ${message}`);
         this.send(`say ${message}`);
     }
